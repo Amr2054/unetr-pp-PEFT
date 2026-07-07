@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+dataset
+configs/config.yaml
+runs
+synapse_weights
