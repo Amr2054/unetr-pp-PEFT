@@ -116,7 +116,7 @@ class SpleenDataset:
 
         print("Caching Validation Data into RAM")
         val_ds = CacheDataset(data=self.val_files, transform=val_transforms, cache_rate=1.0, num_workers=self.num_workers)
-        val_loader = DataLoader(val_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+        val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=self.num_workers)
 
         return train_loader,val_loader
 

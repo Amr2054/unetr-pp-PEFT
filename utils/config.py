@@ -1,7 +1,4 @@
 import yaml
-import numpy as np
-from pydantic_settings import BaseSettings, SettingsConfigDict
-import os
 
 class Config:
     def __init__(self, config_dict):
