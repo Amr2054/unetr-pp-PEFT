@@ -4,6 +4,7 @@ class Config:
     def __init__(self, config_dict):
         self.paths = config_dict.get("paths", {})
         self.training = config_dict.get("training", {})
+        self.peft = config_dict.get("peft", {})
 
 
     def __repr__(self):

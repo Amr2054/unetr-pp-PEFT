@@ -13,3 +13,12 @@ training:
   early_stopping_patience: 15
   roi_size: [64, 128, 128]
   sw_batch_size: 4
+
+
+peft:
+method: "lora"   # one of: full_finetune | linear_probe | lora
+lora:
+  r: 8
+  alpha: 16
+  dropout: 0.0
+  target_attr:  ["qkvv", "out_proj", "out_proj2"]
