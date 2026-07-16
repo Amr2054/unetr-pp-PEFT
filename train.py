@@ -19,11 +19,13 @@ from monai.inferers import sliding_window_inference
 from monai.utils import set_determinism
 from monai.losses import DeepSupervisionLoss
 
+
 # Custom Imports
 from data.dataset import SpleenDataset
 from unetr_pp.unetr_pp_synapse import UNETR_PP
 from utils import load_config
 from utils import load_checkpoint, save_checkpoint, setup_logger, setup_run_dir
+from peft_methods import apply_lora_to_model, freeze_for_lora, freeze_model, set_train_mode, trainable_param_summary,save_lora_state
 
 set_determinism(seed=42)
 
@@ -47,10 +49,6 @@ def load_pretrained_synapse(model_path,logger):
 
     if matched < 0.5 * total:
         raise RuntimeError(f"Only {matched}/{total} keys matched — backbone is likely NOT loaded. Check key naming.")
-
-    # missing = [k for k in model_dict if k not in filtered_dict and not k.startswith("out")]
-    # print("Unexpected missing keys:", missing)
-    # assert len(missing) == 0, "Something other than the output heads failed to load!"
 
     model_dict.update(filtered_dict)
     model.load_state_dict(model_dict, strict=True)
@@ -95,8 +93,28 @@ def train_model():
     spleen_dataset = SpleenDataset(data_dir=str(data_dir), batch_size=config.training['batch_size'], val_fraction=0.2, num_workers=4)
     train_loader, val_loader = spleen_dataset.get_spleen_dataloaders()
 
-    # Model, Loss, Optimizer and Scheduler
-    model = load_pretrained_synapse(str(weights_path),logger=logger).to(device)
+    model = load_pretrained_synapse(str(weights_path),logger=logger)
+
+    method = config.peft.get('method', 'full_finetune')
+
+    lora_layers = []
+
+    if method == "linear_probe":
+        frozen_bn = freeze_model(model, lambda name: name.startswith(("out1", "out2", "out3")))
+    elif method == "lora":
+        lcfg = config.peft['lora']
+        lora_layers = apply_lora_to_model(model, target_attr=lcfg['target_attr'],
+                                           r=lcfg['r'], alpha=lcfg['alpha'], dropout=lcfg.get('dropout', 0.0))
+        frozen_bn = freeze_for_lora(model, trainable_prefixes=("out1", "out2", "out3"))
+        print(frozen_bn)
+    else:
+        frozen_bn = []
+
+    model = model.to(device)
+    trainable, total, pct = trainable_param_summary(model)
+    logger.info(f"Mode: {method} | Trainable: {trainable:,}/{total:,} ({pct:.2f}%)")
+
+
     optimizer = AdamW(model.parameters(), lr=config.training['learning_rate'], weight_decay=config.training['weight_decay'])
 
     steps_per_epoch = len(train_loader)
@@ -135,7 +153,8 @@ def train_model():
         print(f"Epoch {epoch + 1}/{max_epochs}")
         
         # --- TRAINING ---
-        model.train()
+        set_train_mode(model, frozen_bn)
+            
         epoch_loss = 0
         step = 0
         
@@ -201,8 +220,12 @@ def train_model():
                     best_metric_epoch = epoch + 1
                     patience_counter = 0
       
-                    torch.save(model.state_dict(), small_ckpt_path)
+                    if method == "lora":
+                        save_lora_state(model, small_ckpt_path, trainable_prefixes=("out1", "out2", "out3"))
+                    else:
+                        torch.save(model.state_dict(), small_ckpt_path)
                     logger.info(f" New Best Model Saved! (Score: {best_metric:.4f})")
+
                 else:
                     patience_counter += 1
                     logger.info(f"No improvement. Patience Counter: {patience_counter}/{patience_limit}")
