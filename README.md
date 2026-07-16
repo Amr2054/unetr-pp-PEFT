@@ -3,20 +3,22 @@
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?logo=pytorch&logoColor=white)
 ![MONAI](https://img.shields.io/badge/MONAI-3D%20Medical%20Imaging-orange)
-<!-- ![Status](https://img.shields.io/badge/Status-Phase%201%20Complete-brightgreen) -->
 ![Best Dice](https://img.shields.io/badge/Best%20Dice-0.9515-success)
+![LoRA Params](https://img.shields.io/badge/LoRA%20Trainable-0.31%25-blueviolet)
 
 > Investigating whether a segmentation transformer pretrained on 13 abdominal organs can be efficiently adapted to a new, data-scarce single-organ task — without training from scratch.
 
 ## Overview
 
-State-of-the-art 3D Vision Transformers (ViTs) like **UNETR++** utilize advanced spatial attention mechanisms to achieve highly accurate volumetric segmentation. However, these heavy transformer architectures are computationally expensive and require massive labeled datasets to train from scratch. In applied computer vision, engineers are far more likely to adapt an existing pretrained ViT to a data-scarce task than to train from zero.*(For full architectural details on the Efficient Paired Attention mechanism, refer to the original paper: [UNETR++: Delving into Efficient and Accurate 3D Medical Image Segmentation (Shaker et al., IEEE TMI 2024)](https://arxiv.org/abs/2212.04497)).*
+State-of-the-art 3D Vision Transformers like **UNETR++** use an efficient paired spatial-and-channel attention mechanism to achieve highly accurate volumetric segmentation. But these architectures are expensive to train from scratch and hungry for labeled data — resources most real clinical settings simply don't have. *(Full architectural details: [UNETR++: Delving into Efficient and Accurate 3D Medical Image Segmentation, Shaker et al., IEEE TMI 2024](https://arxiv.org/abs/2212.04497).)*
 
-This repository explores the limits of ViT domain adaptation. It asks a concrete question: **can a 3D segmentation transformer pretrained on a complex 13-organ dataset (Synapse/BTCV) be adapted to a new, single-organ target using a severely limited data budget?**
+This repository explores a concrete version of that constraint: **can a 3D segmentation transformer pretrained on a 13-organ CT dataset (Synapse) be adapted to a new, single-organ target using a severely limited data budget and modest hardware — hardware a hospital, or a single researcher, could actually access?**
 
-This repository establishes **Phase 1: the Full Fine-Tuning Baseline**. By achieving >0.95 Dice on just 33 training patients, it proves that the pretrained transformer weights transfer effectively to a novel task. This establishes a strong benchmark for upcoming parameter-efficient fine-tuning (PEFT) experiments.
+![Dice comparison across all tested strategies](assets/dice_comparison.png)
 
-## Phase 1 Key Results (Full Fine-Tuning)
+## Phase 1 — Full Fine-Tuning Baseline
+
+By achieving >0.95 Dice on just 33 training patients, this phase establishes that the Synapse-pretrained weights transfer effectively to spleen — a strong ceiling to measure every subsequent, cheaper strategy against.
 
 | | |
 |---|---|
@@ -24,62 +26,87 @@ This repository establishes **Phase 1: the Full Fine-Tuning Baseline**. By achie
 | **Target task** | MSD Spleen (Task09_Spleen) — 41 CT volumes, single organ, binary segmentation |
 | **Adaptation strategy** | Full fine-tuning (all backbone weights + freshly initialized 2-class output heads) |
 | **Data split** | 33 train / 8 validation |
-| **Best Mean Dice** | **0.9515**    |
+| **Best Mean Dice** | **0.9515** |
 
-For reference, this matches the performance of a fully-converged CNN U-Net trained from scratch on this dataset, but achieves it with a fraction of the domain-specific data — a meaningful result given the backbone was never trained on spleen data directly.
+For reference, this matches a fully-converged CNN U-Net trained from scratch on this dataset (per MONAI's own Spleen tutorial), achieved here with a fraction of the domain-specific data.
+
+## Phase 2 — Parameter-Efficient Fine-Tuning (LoRA)
+
+To test whether full fine-tuning's cost is actually necessary, Phase 2 implements a **custom Low-Rank Adaptation (LoRA)** wrapper, injecting trainable rank-decomposition matrices directly into UNETR++'s attention blocks while freezing the rest of the network.
+
+| | |
+|---|---|
+| **Adaptation strategy** | Custom LoRA (rank = 8) injected into `qkvv`, `out_proj`, and `out_proj2` |
+| **Frozen parameters** | ~43,086,638 (CNN stem, transformer encoder/decoder, all BatchNorm statistics) |
+| **Trainable parameters** | 135,398 (LoRA matrices + freshly initialized output heads) — **0.31%** of the network |
+| **Best Mean Dice** | **0.9402** |
+
+![Parameter efficiency frontier](assets/efficiency_frontier.png)
+
+*Takeaway: training 0.31% of the network recovers Dice within ~0.01 of full fine-tuning. One honest caveat worth stating plainly: spleen is not a novel organ to this backbone — it's one of Synapse's own 13 pretrained classes, chosen deliberately as a controlled validation task with a known ceiling to measure against. This result demonstrates that Synapse's pretrained features transfer efficiently to a related, data-scarce task; it does not yet demonstrate generalization to a genuinely unseen organ — that's the next planned experiment (see Roadmap).*
+
 
 ## Fine-Tuning Pipeline
 
-Before trusting any result from a pretrained checkpoint, this pipeline verifies the transfer explicitly:
+- **Exact key accounting** — the model contains 636 total parameter/buffer tensors. Exactly 6 belong to the three multi-resolution output heads, freshly initialized for 2 classes instead of Synapse's original 13. The remaining 630 backbone tensors matched the checkpoint by name and shape with zero exceptions, confirmed by explicit programmatic audit.
+- **MONAI-based 3D data pipeline** — intensity windowing, foreground-aware cropping, anisotropic spacing normalization, and positive/negative-balanced patch sampling (`RandCropByPosNegLabeld`) for a small, class-imbalanced dataset.
+- **Deep-supervision shape alignment** — UNETR++'s 3 auxiliary output heads sit at different decoder resolutions; `monai.losses.DeepSupervisionLoss` correctly downsamples the ground truth per scale rather than naively comparing mismatched resolutions.
+- **Custom LoRA wrapper** (`peft_methods/lora.py`) — targets `qkvv`, `out_proj`, and `out_proj2` by direct module reference rather than by name, since UNETR++'s fused-attention design has no separately-named query/key/value layers for off-the-shelf PEFT tooling to target.
+- **Zero-latency deployment path** — `LoRALinear.merge()` folds trained LoRA matrices directly into the frozen base weights, producing an architecture identical to the original network for inference, with no added latency.
+- **Automated run tracking** — every run writes a timestamped `runs/` directory containing its exact config, training log, TensorBoard metrics, and a fully resumable checkpoint (optimizer, scheduler, scaler, and RNG state included).
 
-- **Exact key accounting** — the model contains 636 total parameter/buffer tensors. Exactly 6 belong to the three multi-resolution output heads, which are freshly initialized for 2 classes instead of Synapse's original 13. The remaining 630 backbone tensors matched the checkpoint by name and shape with zero exceptions, confirmed by an explicit programmatic audit rather than assumed from the result alone.
-- **MONAI-based 3D data pipeline** — on-the-fly intensity windowing (Hounsfield units), foreground-aware cropping, anisotropic spacing normalization, and positive/negative-balanced patch sampling (`RandCropByPosNegLabeld`) to combat extreme class imbalance.
-- **Deep-supervision shape alignment** — UNETR++ outputs 3 auxiliary masks at different decoder resolutions. The pipeline uses `monai.losses.DeepSupervisionLoss` to correctly downsample the ground truth and weight each scale during backpropagation, rather than naively comparing mismatched resolutions.
-- **Automated run tracking** — every run generates a timestamped `runs/` directory containing an isolated `config.yaml`, TensorBoard metrics, training logs, and a fully resumable checkpoint.
+## Sample Results
+
+![Sample Results](assets/Sample.png)
 
 ## Repository Structure
 
 ```text
 .
 ├── configs/
-│   └── config.yaml             
+│   └── config.yaml
 ├── data/
-│   └── dataset.py           
-├── unetr_pp/ # UNETR++ model (adapted from official repo)          
+│   └── dataset.py
+├── unetr_pp/                     # UNETR++ model (adapted from official repo)
+├── peft_methods/                 # PEFT technique implementations
+│   ├── freezing.py               # shared freeze + BatchNorm-eval logic
+│   └── lora.py                   # custom LoRA wrapper for fused attention
 ├── utils/
-│   ├── config.py               
-│   └── model_utils.py           
-├── train.py               
-└── runs/                        
+│   ├── config.py
+│   └── model_utils.py
+├── train.py
+├── test.py                       # inference + labeled comparison image export
+└── runs/
 ```
 
 ## Setup
 
-1. Clone the repository and install the dependencies:
-    
+1. Clone the repository and install dependencies:
     ```bash
     pip install -r requirements.txt
     ```
-
 2. Download the **MSD Spleen** dataset (Task09_Spleen) from the [Medical Segmentation Decathlon](http://medicaldecathlon.com/).
 3. Download the official **Synapse-pretrained UNETR++ checkpoint** from the [official repository](https://github.com/Amshaker/unetr_plus_plus).
 4. Update `data_dir` and `weights_path` in `configs/config.yaml`.
 
 ## Usage
 
+**Train:**
 ```bash
 python train.py
 ```
+Set `peft.method` in `config.yaml` to `full_finetune`, `linear_probe`, or `lora`. Logs, the best checkpoint, and a fully resumable checkpoint are written to `runs/<timestamp>_<run_name>/`.
 
-Training logs, the best checkpoint (by validation Dice), and a fully resumable checkpoint are automatically written to `runs/<timestamp>_spleen_unetr_pp/`. Resuming an interrupted run is as simple as passing the run's directory name into `resume_dir` inside the config file.
+**Test and generate comparison images:**
+```bash
+python test.py --checkpoint runs/<run>/best_model_weights.pth --num_samples 3
+```
+Runs inference on held-out validation volumes (or any arbitrary NIfTI file via `--image_path`) and saves labeled CT / prediction / ground-truth / error-map panels to `test_outputs/`.
 
-<!-- ## Current Status & Next Steps
+## Roadmap
 
-**Phase 1 (the fine-tuning baseline) is complete.** The next phases of this project will explore:
-
-- **Parameter-efficient adapters** — inserting lightweight adapter modules into the Efficient Paired Attention (EPA) blocks while freezing the backbone, to drastically reduce trainable parameters.
-- **Linear probing** — freezing the entire encoder/decoder and training only the output heads, to test the raw feature-extraction power of the Synapse weights on their own.
-- **nnU-Net baseline** — a CNN trained from scratch on the same split, as the control condition for the central question above. -->
+- **Genuine novel-organ generalization test** — the current LoRA result validates efficient transfer to a *related* task (spleen is already one of Synapse's 13 pretrained organs). The next experiment targets an organ genuinely absent from Synapse's class list to test whether this adaptation approach generalizes beyond re-deriving something the backbone already implicitly knew.
+- Lightweight FastAPI + UI deployment demonstrating hospital-side fine-tuning at low compute cost.
 
 ## Acknowledgments
 
