@@ -106,7 +106,6 @@ def train_model():
         lora_layers = apply_lora_to_model(model, target_attr=lcfg['target_attr'],
                                            r=lcfg['r'], alpha=lcfg['alpha'], dropout=lcfg.get('dropout', 0.0))
         frozen_bn = freeze_for_lora(model, trainable_prefixes=("out1", "out2", "out3"))
-        print(frozen_bn)
     else:
         frozen_bn = []
 

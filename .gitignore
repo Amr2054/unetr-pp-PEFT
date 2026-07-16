@@ -221,3 +221,4 @@ dataset
 configs/config.yaml
 synapse_weights
 settings.json
+*.pth
