@@ -1,0 +1,17 @@
+paths:
+  split_file: configs/splits/msd_spleen.json
+  data_dir: dataset/Task09_Spleen/Task09_Spleen
+  weights_path: synapse_weights/model_final_checkpoint.model
+
+training:
+  max_epochs: 100
+  val_interval: 2
+  batch_size: 1
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  early_stopping_patience: 15
+  roi_size: [64, 128, 128]
+  sw_batch_size: 4
+
+peft:
+  method: full_finetune

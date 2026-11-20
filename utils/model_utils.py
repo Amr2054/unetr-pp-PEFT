@@ -50,7 +50,7 @@ def setup_logger(run_dir):
 
 def setup_run_dir(root):
     """Creates a timestamped run directory and returns its path."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     run_dir = root / "runs" / f"{timestamp}_spleen_unetr_pp"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(parents=True)
     return run_dir
