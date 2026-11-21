@@ -59,7 +59,7 @@ def run_inference(model, image, roi_size, sw_batch_size, device, spleen_class=No
         logits = sliding_window_inference(
             inputs=image, roi_size=roi_size, sw_batch_size=sw_batch_size,
             predictor=lambda x: model(x)[0], overlap=0.5,
-        ) #TODO Switch to do_ds=False in the model and remove the predictor lambda if you want to use the model's built-in sliding_window_inference.
+        ) 
     prediction = logits.argmax(dim=1, keepdim=True)
     return prediction if spleen_class is None else prediction == spleen_class
 
@@ -100,12 +100,12 @@ def save_comparison_image(ct_vol, pred_vol, gt_vol, out_path, title_extra=""):
     axes[0].imshow(ct_norm, cmap="gray")
     axes[0].set_title("CT slice")
 
-    axes[1].imshow(overlay(ct_norm, pred_slice, color=(0, 255, 0)))
+    axes[1].imshow(overlay(ct_norm, pred_slice, color=(0, 1, 0)))
     axes[1].set_title("Prediction")
 
     if gt_vol is not None:
         gt_slice = gt_vol[:, :, slice_idx]
-        axes[2].imshow(overlay(ct_norm, gt_slice, color=(255, 0, 0)))
+        axes[2].imshow(overlay(ct_norm, gt_slice, color=(1, 0, 0)))
         axes[2].set_title("Ground truth")
 
         tp = (pred_slice > 0) & (gt_slice > 0)
@@ -145,12 +145,12 @@ def evaluate_cases(model, samples, roi_size, sw_batch_size, device, out_dir, met
         if profile is not None:
             profile.stop(filename=filename, volume_shape=list(image.shape[2:]))
 
-        title = ""
+        title = f"Predicted spleen voxels (3D): {pred.count_nonzero().item()}"
         if gt is not None:
             d = dice_score(pred, gt.to(device))
             dice_scores[filename] = d
-            title = f"Dice: {d:.4f}"
-            print(f"{filename}: {title}")
+            title += f" | Dice: {d:.4f}"
+        print(f"{filename}: {title}")
 
         save_comparison_image(sample["image"], pred, gt, out_dir / f"{Path(filename).stem}.png", title)
 

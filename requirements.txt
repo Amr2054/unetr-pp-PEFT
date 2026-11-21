@@ -10,3 +10,5 @@ scipy>=1.10,<2
 scikit-image>=0.20,<1
 batchgenerators>=0.25,<0.26
 tqdm>=4.64,<5
+nibabel>=3.2.1,<4
+PyYAML>=6.0,<7
