@@ -13,7 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 # MONAI Imports
 from monai.losses import DiceCELoss
 from monai.metrics import DiceMetric
-from monai.transforms import Compose, AsDiscrete
+from monai.transforms import Compose, AsDiscrete, LoadImage, Orientation
 from monai.data import decollate_batch
 from monai.inferers import sliding_window_inference
 from monai.utils import set_determinism
@@ -24,10 +24,32 @@ from monai.losses import DeepSupervisionLoss
 from data.dataset import SpleenDataset
 from unetr_pp.unetr_pp_synapse import UNETR_PP
 from utils import load_config
+from utils.compute_profile import ComputeProfile
 from utils import load_checkpoint, save_checkpoint, setup_logger, setup_run_dir
 from peft_methods import apply_lora_to_model, freeze_for_lora, freeze_model, set_train_mode, trainable_param_summary,save_lora_state
 
 set_determinism(seed=42)
+
+
+def log_preprocessing_preview(writer, sample):
+    """Show the same spleen level before and after validation preprocessing."""
+    processed = sample["image"]
+    raw = LoadImage(image_only=True, ensure_channel_first=True)(processed.meta["filename_or_obj"])
+    raw = Orientation(axcodes="RAS")(raw)  # Reorient for display; keep the native grid and HU.
+
+    areas = sample["label"][0].sum(dim=(0, 1))
+    z = int(areas.argmax()) if areas.max() > 0 else processed.shape[-1] // 2
+    # Cropping and spacing change slice indices. Map the slice center through patient space.
+    center = processed.affine.new_tensor([(processed.shape[1] - 1) / 2,
+                                          (processed.shape[2] - 1) / 2, z, 1])
+    raw_center = torch.linalg.solve(raw.affine, processed.affine @ center)
+    raw_z = int(raw_center[2].round().clamp(0, raw.shape[-1] - 1))
+
+    before = (raw[0, :, :, raw_z].as_tensor().clamp(-1000, 1000) + 1000) / 2000
+    after = processed[0, :, :, z].as_tensor()
+    tag = f"Preprocessing/{sample['filename']}"
+    writer.add_image(f"{tag}/1_before", before.rot90(1, (0, 1)), 0, dataformats="HW")
+    writer.add_image(f"{tag}/2_after", after.rot90(1, (0, 1)), 0, dataformats="HW")
 
 
 def load_pretrained_synapse(model_path,logger):
@@ -57,14 +79,17 @@ def load_pretrained_synapse(model_path,logger):
 
 def train_model():
 
-    ROOT = Path(__file__).resolve().parent
+    ROOT = Path(__file__).resolve().parents[1]
 
-    config_path = args.config if args.config else ROOT / "configs" / "config.yaml"
+    default_config = ROOT / "configs" / "training" / "local.yaml"
+    config_path = args.config or (ROOT / args.resume / "config.yaml" if args.resume else default_config)
     config = load_config(str(config_path))
     resume_dir_str = args.resume if args.resume else config.training.get('resume_dir', "")
     
-    if resume_dir_str and (ROOT / resume_dir_str).exists():
+    if resume_dir_str:
         run_dir = ROOT / resume_dir_str
+        if not (run_dir / "split.json").is_file():
+            raise FileNotFoundError(f"Resuming requires the original patient split at {run_dir / 'split.json'}")
         logger = setup_logger(run_dir)
         logger.info(f"RESUMING RUN in: {run_dir}")
     else:
@@ -72,6 +97,7 @@ def train_model():
         logger = setup_logger(run_dir)
         logger.info(f"NEW RUN in: {run_dir}")
         shutil.copy(config_path, run_dir / "config.yaml")
+        shutil.copyfile(config.paths["split_file"], run_dir / "split.json")
 
 
     data_dir = config.paths['data_dir']
@@ -90,8 +116,13 @@ def train_model():
     logger.info(f"Training on device: {device}")
 
     # DataLoaders
-    spleen_dataset = SpleenDataset(data_dir=str(data_dir), batch_size=config.training['batch_size'], val_fraction=0.2, num_workers=4)
+    spleen_dataset = SpleenDataset(data_dir, run_dir / "split.json",
+                                   batch_size=config.training['batch_size'], num_workers=4)
+    logger.info(f"Patient split: {len(spleen_dataset.train_files)} training, "
+                f"{len(spleen_dataset.val_files)} validation (split.json)")
     train_loader, val_loader = spleen_dataset.get_spleen_dataloaders()
+    if not resume_dir_str:
+        log_preprocessing_preview(writer, val_loader.dataset[0])
 
     model = load_pretrained_synapse(str(weights_path),logger=logger)
 
@@ -145,6 +176,9 @@ def train_model():
 
     patience_counter = 0
     logger.info("Starting Training Loop")
+    profile_epoch = None
+    if args.profile and not (run_dir / "compute_metrics.json").exists():
+        profile_epoch = min(start_epoch + 1, max_epochs - 1)
 
     # Training Loop
     for epoch in range(start_epoch,max_epochs):
@@ -155,13 +189,20 @@ def train_model():
         set_train_mode(model, frozen_bn)
             
         epoch_loss = 0
+        train_head_loss_sum = 0.0
+        train_patches = 0
         step = 0
+        profile = ComputeProfile(device) if epoch == profile_epoch else None
         
         for batch_data in train_loader:
             step += 1
             inputs, labels = batch_data["image"].to(device), batch_data["label"].to(device)
             
             optimizer.zero_grad()
+            # For a one-epoch run, warm up on its first step.
+            measure = profile is not None and (epoch > start_epoch or step > 1)
+            if measure:
+                profile.start()
             with autocast(amp_device):
                 outputs = model(inputs)  # list of 3 logits at different resolutions
                 total_loss = loss_function(outputs, labels) # # downsampling + weighting + summing, all handled internally
@@ -169,13 +210,32 @@ def train_model():
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            if measure:
+                profile.stop(step=step, patches=inputs.shape[0])
             scheduler.step()
 
+            # Record the monitoring loss outside the timed optimizer step.
+            with torch.no_grad():
+                head_loss = base_loss(outputs[0].detach().float(), labels)
+                train_head_loss_sum += head_loss.item() * inputs.shape[0]
+                train_patches += inputs.shape[0]
             
             epoch_loss += total_loss.item()
             logger.info(f"Step {step}/{len(train_loader)}, Train Loss: {total_loss.item():.4f}")
             writer.add_scalar("Train/Step_Loss", total_loss.item(), epoch * len(train_loader) + step)
             
+        if profile is not None:
+            if profile.samples:
+                logger.info(profile.save(
+                    run_dir, "training", method=method, epoch=epoch + 1,
+                    precision=f"autocast {torch.get_autocast_dtype(amp_device)}",
+                    patient_batch_size=config.training["batch_size"], patch_shape=list(inputs.shape[2:]),
+                    trainable_parameters=trainable, total_parameters=total,
+                ))
+            else:
+                logger.info("Profiling needs at least one optimizer step after warm-up.")
+        train_head_loss = train_head_loss_sum / train_patches
+        writer.add_scalars("Loss/Full_resolution_DiceCE", {"train": train_head_loss}, epoch + 1)
         epoch_loss /= step
         writer.add_scalar("Train/Epoch_Average_Loss", epoch_loss, epoch + 1)
         logger.info(f"Epoch {epoch + 1} Average Loss: {epoch_loss:.4f}")
@@ -184,6 +244,8 @@ def train_model():
         # --- VALIDATION ---
         if (epoch + 1) % val_interval == 0:
             model.eval()
+            val_loss_sum = 0.0
+            val_patients = 0
             with torch.no_grad():
                 for val_data in val_loader:
                     val_inputs, val_labels = val_data["image"].to(device), val_data["label"].to(device)
@@ -201,12 +263,20 @@ def train_model():
                         overlap=0.5
                     )
                     
+                    # Validation loader yields one complete patient per batch.
+                    val_loss_sum += base_loss(val_outputs.float(), val_labels).item()
+                    val_patients += 1
+
                     # Post-process batch into lists of separate discrete tensors
                     val_outputs = [post_pred(i) for i in decollate_batch(val_outputs)]
                     val_labels = [post_label(i) for i in decollate_batch(val_labels)]
             
                     dice_metric(y_pred=val_outputs, y=val_labels)
 
+                val_loss = val_loss_sum / val_patients
+                writer.add_scalar("Validation/Epoch_Average_Loss", val_loss, epoch + 1)
+                writer.add_scalars("Loss/Full_resolution_DiceCE", {"validation": val_loss}, epoch + 1)
+                logger.info(f"Full-resolution DiceCE | train: {train_head_loss:.4f} | validation: {val_loss:.4f}")
                 metric = dice_metric.aggregate().item()
                 dice_metric.reset()
                 
@@ -246,6 +316,7 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, required=False, help="Path to YAML config file")
     parser.add_argument("--epochs", type=int, required=False, help="number of epochs to train")
     parser.add_argument("--resume", type=str, required=False, help="Path to resume training from")
+    parser.add_argument("--profile", action="store_true", help="Measure optimizer step time and peak GPU memory.")
 
     args = parser.parse_args()
     train_model()

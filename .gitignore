@@ -218,7 +218,13 @@ __marimo__/
 .streamlit/secrets.toml
 
 dataset
-configs/config.yaml
+configs/training/config.yaml
+configs/training/local.yaml
 synapse_weights
 settings.json
 *.pth
+outputs/
+papers
+docs
+runs
+AGENTS.md

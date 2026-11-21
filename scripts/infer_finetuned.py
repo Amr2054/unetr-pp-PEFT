@@ -1,37 +1,19 @@
-"""
-test.py — run inference with a trained (full fine-tune / linear probe / LoRA)
-model, on either your dataset's own held-out validation volumes or any
-arbitrary NIfTI file, and save labeled comparison images for the README.
-
-Usage:
-    # Run on your dataset's own held-out validation volumes:
-    python test.py --checkpoint runs/<run>/best_model_weights.pth
-
-    # Run on any arbitrary CT volume, with ground truth for comparison:
-    python test.py --checkpoint runs/<run>/best_model_weights.pth \\
-        --image_path /path/to/scan.nii.gz --label_path /path/to/mask.nii.gz
-
-    # Run on an arbitrary volume with NO ground truth available:
-    python test.py --checkpoint runs/<run>/best_model_weights.pth \\
-        --image_path /path/to/scan.nii.gz
-"""
+"""Evaluate the saved test split or predict on a NIfTI image or directory."""
 import argparse
+from itertools import islice
 from pathlib import Path
 
 import numpy as np
 import torch
+from utils.dice_reporting import save_dice_scores
 import matplotlib.pyplot as plt
-from monai.transforms import (
-    Compose, LoadImaged, EnsureChannelFirstd, ScaleIntensityRanged,
-    CropForegroundd, Orientationd, Spacingd, ToTensord,
-)
-from monai.data import Dataset, DataLoader
 from monai.inferers import sliding_window_inference
 
-from data.dataset import SpleenDataset
+from data.dataset import get_split_test_dataloader, get_test_dataloader
 from unetr_pp.unetr_pp_synapse import UNETR_PP
 from peft_methods.lora import apply_lora_to_model
 from utils import load_config
+from utils.compute_profile import ComputeProfile
 
 def build_model(config, checkpoint_path, device):
     method = config.peft.get('method', 'full_finetune')
@@ -71,28 +53,15 @@ def build_model(config, checkpoint_path, device):
     return model
 
 
-def get_single_volume_transforms(has_label: bool):
-    keys = ["image", "label"] if has_label else ["image"]
-    mode = ("bilinear", "nearest") if has_label else "bilinear"
-    return Compose([
-        LoadImaged(keys=keys),
-        EnsureChannelFirstd(keys=keys),
-        ScaleIntensityRanged(keys=["image"], a_min=-57, a_max=164, b_min=0.0, b_max=1.0, clip=True),
-        CropForegroundd(keys=keys, source_key="image", allow_smaller=True),
-        Orientationd(keys=keys, axcodes="RAS"),
-        Spacingd(keys=keys, pixdim=(1.5, 1.5, 2.0), mode=mode),
-        ToTensord(keys=keys),
-    ])
-
-
-def run_inference(model, image, roi_size, sw_batch_size, device):
+def run_inference(model, image, roi_size, sw_batch_size, device, spleen_class=None):
     image = image.to(device)
     with torch.no_grad():
         logits = sliding_window_inference(
             inputs=image, roi_size=roi_size, sw_batch_size=sw_batch_size,
             predictor=lambda x: model(x)[0], overlap=0.5,
-        )
-    return logits.argmax(dim=1, keepdim=True)  # (B,1,H,W,D), values 0 or 1
+        ) 
+    prediction = logits.argmax(dim=1, keepdim=True)
+    return prediction if spleen_class is None else prediction == spleen_class
 
 
 def dice_score(pred, gt):
@@ -131,12 +100,12 @@ def save_comparison_image(ct_vol, pred_vol, gt_vol, out_path, title_extra=""):
     axes[0].imshow(ct_norm, cmap="gray")
     axes[0].set_title("CT slice")
 
-    axes[1].imshow(overlay(ct_norm, pred_slice, color=(0, 255, 0)))
+    axes[1].imshow(overlay(ct_norm, pred_slice, color=(0, 1, 0)))
     axes[1].set_title("Prediction")
 
     if gt_vol is not None:
         gt_slice = gt_vol[:, :, slice_idx]
-        axes[2].imshow(overlay(ct_norm, gt_slice, color=(255, 0, 0)))
+        axes[2].imshow(overlay(ct_norm, gt_slice, color=(1, 0, 0)))
         axes[2].set_title("Ground truth")
 
         tp = (pred_slice > 0) & (gt_slice > 0)
@@ -157,26 +126,84 @@ def save_comparison_image(ct_vol, pred_vol, gt_vol, out_path, title_extra=""):
     plt.close(fig)
 
 
+def evaluate_cases(model, samples, roi_size, sw_batch_size, device, out_dir, method,
+                   split, enable_profile, spleen_class=None):
+    profile = ComputeProfile(device) if enable_profile else None
+    dice_scores = {}
+
+    for sample in samples:
+        image = sample["image"].to(device)
+        gt = sample.get("label")
+        filename = sample["filename"][0]
+        if profile is not None:
+            if not profile.samples:
+                run_inference(model, image, roi_size, sw_batch_size, device, spleen_class)
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+            profile.start()
+        pred = run_inference(model, image, roi_size, sw_batch_size, device, spleen_class)
+        if profile is not None:
+            profile.stop(filename=filename, volume_shape=list(image.shape[2:]))
+
+        title = f"Predicted spleen voxels (3D): {pred.count_nonzero().item()}"
+        if gt is not None:
+            d = dice_score(pred, gt.to(device))
+            dice_scores[filename] = d
+            title += f" | Dice: {d:.4f}"
+        print(f"{filename}: {title}")
+
+        save_comparison_image(sample["image"], pred, gt, out_dir / f"{Path(filename).stem}.png", title)
+
+        del pred, image
+
+    save_dice_scores(out_dir, dice_scores)
+    if profile is not None:
+        print(profile.save(
+            out_dir, "inference", method=method, split=split, precision=str(next(model.parameters()).dtype),
+            roi_size=roi_size, sw_batch_size=sw_batch_size, overlap=0.5,
+        ))
+
+
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=str, required=False)
     parser.add_argument("--checkpoint", type=str, required=True,
                          help="Path to a trained model checkpoint (best_model_weights.pth).")
-    parser.add_argument("--image_path", type=str, required=False,
-                         help="Optional: run on a specific NIfTI file instead of the dataset's own val split.")
-    parser.add_argument("--label_path", type=str, required=False,
-                         help="Optional ground truth for --image_path (skip if unavailable).")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--split", choices=("validation", "test"), help="Manifest patients to evaluate (default: test).")
+    source.add_argument("--image_path", type=Path,
+                         help="A NIfTI image or directory. Defaults to the run's saved test list.")
+    parser.add_argument("--label_path", type=Path,
+                         help="Optional NIfTI mask or directory of masks with matching filenames.")
     parser.add_argument("--num_samples", type=int, default=None,
-                         help="Limit how many validation volumes to process (default: all).")
-    parser.add_argument("--output_dir", type=str, default="test_outputs")
+                         help="Limit how many images to process (default: all).")
+    parser.add_argument("--profile", action="store_true", help="Measure prediction time and peak GPU memory per CT.")
+    parser.add_argument("--output_dir", type=Path)
     args = parser.parse_args()
 
-    ROOT = Path(__file__).resolve().parent
-    config_path = args.config if args.config else ROOT / "configs" / "config.yaml"
-    config = load_config(str(config_path))
+    if args.num_samples is not None and args.num_samples < 1:
+        parser.error("--num_samples must be at least 1")
+    ROOT = Path(__file__).resolve().parents[1]
+    run_dir = Path(args.checkpoint).parent
+    run_config = run_dir / "config.yaml"
+    default_config = run_config if run_config.is_file() else ROOT / "configs/training/local.yaml"
+    config = load_config(args.config or default_config)
+    split = "explicit" if args.image_path else (args.split or "test")
+    if args.image_path is None:
+        if args.label_path is not None:
+            parser.error("--label_path requires --image_path")
+        split_file = run_dir / "split.json"
+        if not split_file.is_file():
+            if not (args.config and config.paths.get("split_file")):
+                parser.error(f"Missing {split_file}. Supply --image_path or a --config with paths.split_file.")
+            split_file = Path(config.paths["split_file"])
+        test_loader = get_split_test_dataloader(config.paths["data_dir"], split_file, split)
+    else:
+        test_loader = get_test_dataloader(args.image_path, args.label_path)
 
-    out_dir = Path(args.output_dir)
+    default_dir = Path("outputs/finetuned")
+    out_dir = args.output_dir or (default_dir / "validation" if split == "validation" else default_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -186,51 +213,8 @@ def main():
     roi_size = tuple(config.training['roi_size'])
     sw_batch_size = config.training['sw_batch_size']
 
-    dice_scores = []
-
-    if args.image_path:
-        # --- Single arbitrary sample ---
-        has_label = args.label_path is not None
-        data = {"image": args.image_path}
-        if has_label:
-            data["label"] = args.label_path
-        transforms = get_single_volume_transforms(has_label)
-        sample = transforms(data)
-        image = sample["image"].unsqueeze(0)  # add batch dim
-        gt = sample["label"].unsqueeze(0) if has_label else None
-
-        pred = run_inference(model, image, roi_size, sw_batch_size, device)
-
-        title = ""
-        if has_label:
-            d = dice_score(pred, gt.to(device))
-            dice_scores.append(d)
-            title = f"Dice: {d:.4f}"
-            print(f"{Path(args.image_path).name}: Dice = {d:.4f}")
-
-        save_comparison_image(image, pred, gt, out_dir / f"{Path(args.image_path).stem}.png", title)
-
-    else:
-        # --- Your dataset's own held-out validation volumes ---
-        spleen_dataset = SpleenDataset(data_dir=str(config.paths['data_dir']),
-                                        batch_size=1, val_fraction=0.2, num_workers=4)
-        _, val_loader = spleen_dataset.get_spleen_dataloaders()
-
-        for i, val_data in enumerate(val_loader):
-            if args.num_samples is not None and i >= args.num_samples:
-                break
-            image = val_data["image"]
-            gt = val_data["label"]
-
-            pred = run_inference(model, image, roi_size, sw_batch_size, device)
-            d = dice_score(pred, gt.to(device))
-            dice_scores.append(d)
-            print(f"Volume {i}: Dice = {d:.4f}")
-
-            save_comparison_image(image, pred, gt, out_dir / f"val_volume_{i}.png", f"Dice: {d:.4f}")
-
-    if dice_scores:
-        print(f"\nMean Dice across {len(dice_scores)} volume(s): {sum(dice_scores)/len(dice_scores):.4f}")
+    evaluate_cases(model, islice(test_loader, args.num_samples), roi_size, sw_batch_size, device,
+                   out_dir, config.peft.get("method", "full_finetune"), split, args.profile)
     print(f"Saved comparison images to: {out_dir.resolve()}")
 
 

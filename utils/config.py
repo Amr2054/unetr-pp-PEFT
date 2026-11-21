@@ -10,7 +10,7 @@ class Config:
     def __repr__(self):
         return f"Config(paths={self.paths}, training={self.training})"
 
-def load_config(config_path="config.yaml"):
+def load_config(config_path="configs/training/local.yaml"):
     with open(config_path, "r") as file:
         config = yaml.safe_load(file)
     config = Config(config)

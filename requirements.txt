@@ -5,3 +5,10 @@ timm>=0.9.0,<1.0
 tensorboard>=2.14.0,<3.0
 numpy>=1.24.0,<2.0
 matplotlib == 3.11.0
+SimpleITK>=2.2,<3
+scipy>=1.10,<2
+scikit-image>=0.20,<1
+batchgenerators>=0.25,<0.26
+tqdm>=4.64,<5
+nibabel>=3.2.1,<4
+PyYAML>=6.0,<7
